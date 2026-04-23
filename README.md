@@ -16,7 +16,7 @@ brew install ffmpeg              # macOS
 # sudo apt install ffmpeg        # Debian / Ubuntu
 
 # 2. Install the skill from this repo
-agentino marketplace install dagoSte/agentino-skill-video-brief
+agentino marketplace install agentino-os/agentino-skill-video-brief
 
 # 3. Verify
 agentino skill show video-brief
@@ -66,6 +66,14 @@ agentino run "Given the following video brief, propose 3 YouTube chapter
 titles with timestamps:\n\n$BRIEF"
 ```
 
+## Use with agentino run
+
+```bash
+agentino run "give me a brief of /tmp/talk.mp4 with thumbnails every 30 seconds"
+```
+
+`agentino run` lets the LLM planner pick this skill automatically from the task description — the file path and optional cadence are parsed straight from the prose, no `-i` flags needed.
+
 ## Inputs
 
 | Input | Type | Default | Description |
@@ -91,7 +99,7 @@ Structured JSON with:
 
 ## Chain with `video-cut-silences`
 
-This skill is the first stage of the [`video-auto-trim`](https://github.com/dagoSte/agentino-pipeline-video-auto-trim) pipeline: `video-brief` → [`video-cut-silences`](https://github.com/dagoSte/agentino-skill-video-cut-silences) produces a tightened output with crossfades at every cut.
+This skill is the first stage of the [`video-auto-trim`](https://github.com/agentino-os/agentino-pipeline-video-auto-trim) pipeline: `video-brief` → [`video-cut-silences`](https://github.com/agentino-os/agentino-skill-video-cut-silences) produces a tightened output with crossfades at every cut.
 
 ```bash
 agentino pipeline run video-auto-trim \
