@@ -1,0 +1,351 @@
+metadata:
+  name: video-brief
+  version: "1.0.0"
+  description: "Build an LLM-readable brief of a video: metadata, silence gaps, scene changes, sampled thumbnails — everything a model needs to reason about the content without watching a single frame. No LLM or cloud API used."
+  author: Agentino
+  tags:
+    - video
+    - media
+    - ffmpeg
+    - llm-input
+    - marketplace
+  license: MIT
+  homepage: https://github.com/agentino/agentino
+
+spec:
+  input:
+    - name: path
+      type: string
+      description: "Absolute path to a local video or audio file readable by ffprobe."
+      required: true
+    - name: thumbnail_every_s
+      type: integer
+      description: "Sample one thumbnail every N seconds of media."
+      required: false
+      default: 30
+    - name: max_thumbnails
+      type: integer
+      description: "Hard cap on sampled thumbnails (prevents huge output dirs on long videos)."
+      required: false
+      default: 20
+    - name: silence_threshold_db
+      type: integer
+      description: "Silence detection threshold in dBFS (more negative = quieter). -30 is a good default for clean studio audio, -40 for home recordings."
+      required: false
+      default: -30
+    - name: min_silence_s
+      type: number
+      description: "Only report silences at least this long (seconds)."
+      required: false
+      default: 0.5
+    - name: scene_threshold
+      type: number
+      description: "ffmpeg scene-change sensitivity (0.0 = every frame, 1.0 = never). 0.3 catches meaningful cuts without flagging panning."
+      required: false
+      default: 0.3
+    - name: output_dir
+      type: string
+      description: "Where to write thumbnails. Defaults to a tempdir under /tmp."
+      required: false
+      default: ""
+    - name: max_scene_changes
+      type: integer
+      description: "Hard cap on scene-change entries (keeps the brief tight on action-heavy footage)."
+      required: false
+      default: 50
+
+  output:
+    type: object
+    description: "Video brief — metadata, silence_gaps, scene_changes, thumbnails, plus brief_markdown ready to feed an LLM."
+
+  security:
+    sandbox_level: none
+    network_access: false
+    file_access: read-write
+
+  timeout_s: 300.0
+
+  executor:
+    type: python
+    code: |
+      import hashlib
+      import json
+      import re
+      import shutil
+      import subprocess
+      import tempfile
+      from pathlib import Path
+
+      video_path = Path(input["path"]).expanduser().resolve()
+      if not video_path.is_file():
+          raise FileNotFoundError(f"video file not found: {video_path}")
+
+      # ffmpeg + ffprobe must be discoverable on PATH. We resolve absolute
+      # paths up-front so the rest of the skill never trusts PATH again.
+      ffprobe = shutil.which("ffprobe")
+      ffmpeg = shutil.which("ffmpeg")
+      if not ffprobe or not ffmpeg:
+          raise RuntimeError(
+              "ffmpeg + ffprobe are required. Install via `brew install ffmpeg` "
+              "(macOS) or `apt install ffmpeg` (Debian/Ubuntu). The skill refuses "
+              "to assume a hard-coded location."
+          )
+
+      # Defensive defaults — upstream pipelines sometimes resolve optional
+      # inputs to None when the caller didn't pass them explicitly; coerce
+      # "key present, value None" back to the skill default.
+      def _int(key, fallback):
+          v = input.get(key)
+          return int(v) if v is not None else fallback
+      def _float(key, fallback):
+          v = input.get(key)
+          return float(v) if v is not None else fallback
+
+      thumb_every = max(1, _int("thumbnail_every_s", 30))
+      max_thumbs = max(1, min(_int("max_thumbnails", 20), 200))
+      silence_db = _int("silence_threshold_db", -30)
+      min_silence = _float("min_silence_s", 0.5)
+      scene_thresh = _float("scene_threshold", 0.3)
+      max_scene_changes = max(1, min(_int("max_scene_changes", 50), 500))
+      requested_output = str(input.get("output_dir") or "").strip()
+
+      # Per-video output dir: stable across runs for the same file (hash of
+      # absolute path) so repeated briefs overwrite instead of pile up.
+      path_hash = hashlib.sha1(str(video_path).encode()).hexdigest()[:10]
+      if requested_output:
+          output_dir = Path(requested_output).expanduser().resolve()
+      else:
+          output_dir = Path(tempfile.gettempdir()) / f"video-brief-{path_hash}"
+      output_dir.mkdir(parents=True, exist_ok=True)
+
+      def _run(cmd, *, timeout=120, stdin_input=None):
+          """Run a subprocess, return CompletedProcess. Never raises on exit code."""
+          return subprocess.run(
+              cmd,
+              capture_output=True,
+              text=True,
+              timeout=timeout,
+              input=stdin_input,
+              check=False,
+          )
+
+      # -- 1. Probe metadata ----------------------------------------------
+      probe_cmd = [
+          ffprobe,
+          "-v", "error",
+          "-print_format", "json",
+          "-show_format",
+          "-show_streams",
+          str(video_path),
+      ]
+      probe = _run(probe_cmd, timeout=30)
+      if probe.returncode != 0:
+          raise RuntimeError(f"ffprobe failed: {probe.stderr.strip()[:400]}")
+      probe_data = json.loads(probe.stdout or "{}")
+
+      fmt = probe_data.get("format", {}) or {}
+      streams = probe_data.get("streams", []) or []
+      video_stream = next(
+          (s for s in streams if s.get("codec_type") == "video"), None
+      )
+      audio_stream = next(
+          (s for s in streams if s.get("codec_type") == "audio"), None
+      )
+
+      def _fps(s):
+          # ffprobe reports fps as "30000/1001" rationals — evaluate to float.
+          rate = s.get("r_frame_rate") or s.get("avg_frame_rate") or "0/0"
+          try:
+              num, den = rate.split("/")
+              return round(int(num) / int(den), 3) if int(den) else 0.0
+          except Exception:
+              return 0.0
+
+      def _format_duration(seconds):
+          seconds = max(0.0, float(seconds))
+          h = int(seconds // 3600)
+          m = int((seconds % 3600) // 60)
+          s = seconds - (h * 3600 + m * 60)
+          if h:
+              return f"{h}h {m:02d}m {s:05.2f}s"
+          return f"{m}m {s:05.2f}s"
+
+      duration_s = float(fmt.get("duration", 0.0) or 0.0)
+      metadata = {
+          "duration_s": round(duration_s, 3),
+          "duration_readable": _format_duration(duration_s),
+          "size_bytes": int(fmt.get("size", 0) or 0),
+          "bit_rate": int(fmt.get("bit_rate", 0) or 0),
+          "format_name": fmt.get("format_name", ""),
+          "has_video": video_stream is not None,
+          "has_audio": audio_stream is not None,
+          "video_codec": video_stream.get("codec_name", "") if video_stream else "",
+          "audio_codec": audio_stream.get("codec_name", "") if audio_stream else "",
+          "width": int(video_stream.get("width", 0)) if video_stream else 0,
+          "height": int(video_stream.get("height", 0)) if video_stream else 0,
+          "fps": _fps(video_stream) if video_stream else 0.0,
+          "audio_channels": int(audio_stream.get("channels", 0)) if audio_stream else 0,
+          "audio_sample_rate": int(audio_stream.get("sample_rate", 0)) if audio_stream else 0,
+      }
+
+      # -- 2. Detect silence gaps (audio only) ----------------------------
+      silence_gaps = []
+      if metadata["has_audio"]:
+          silence_cmd = [
+              ffmpeg,
+              "-nostdin",
+              "-hide_banner",
+              "-i", str(video_path),
+              "-af", f"silencedetect=noise={silence_db}dB:d={min_silence}",
+              "-f", "null",
+              "-",
+          ]
+          proc = _run(silence_cmd, timeout=max(60, int(duration_s * 0.5) + 30))
+          # silencedetect writes to stderr regardless of exit status.
+          log = proc.stderr or ""
+          pending_start = None
+          for line in log.splitlines():
+              m_start = re.search(r"silence_start:\s*([0-9.]+)", line)
+              if m_start:
+                  pending_start = float(m_start.group(1))
+                  continue
+              m_end = re.search(
+                  r"silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)",
+                  line,
+              )
+              if m_end and pending_start is not None:
+                  end = float(m_end.group(1))
+                  dur = float(m_end.group(2))
+                  silence_gaps.append({
+                      "start_s": round(pending_start, 3),
+                      "end_s": round(end, 3),
+                      "duration_s": round(dur, 3),
+                  })
+                  pending_start = None
+
+      # -- 3. Detect scene changes (video only) ---------------------------
+      scene_changes = []
+      if metadata["has_video"]:
+          scene_cmd = [
+              ffmpeg,
+              "-nostdin",
+              "-hide_banner",
+              "-i", str(video_path),
+              "-filter:v", f"select='gt(scene,{scene_thresh})',showinfo",
+              "-f", "null",
+              "-",
+          ]
+          proc = _run(scene_cmd, timeout=max(120, int(duration_s * 0.8) + 30))
+          log = proc.stderr or ""
+          for line in log.splitlines():
+              # showinfo emits lines like "[Parsed_showinfo_1 @ 0x...] n:12 pts:XX pts_time:12.345 ..."
+              m = re.search(r"pts_time:([0-9.]+)", line)
+              if m:
+                  scene_changes.append(round(float(m.group(1)), 3))
+                  if len(scene_changes) >= max_scene_changes:
+                      break
+
+      # -- 4. Sample thumbnails (video only) ------------------------------
+      thumbnails = []
+      if metadata["has_video"] and duration_s > 0:
+          # Cap step so we never produce more than max_thumbs frames.
+          est = max(1, int(duration_s // thumb_every))
+          if est > max_thumbs:
+              thumb_every = max(1, int(duration_s // max_thumbs))
+          t = thumb_every / 2  # center the first sample inside its window
+          i = 0
+          while t < duration_s and i < max_thumbs:
+              out = output_dir / f"thumb-{i:03d}-t{int(t):06d}s.jpg"
+              thumb_cmd = [
+                  ffmpeg,
+                  "-nostdin",
+                  "-hide_banner",
+                  "-ss", f"{t:.3f}",
+                  "-i", str(video_path),
+                  "-frames:v", "1",
+                  "-q:v", "3",
+                  "-vf", "scale='min(640,iw)':'-2'",
+                  "-y",
+                  str(out),
+              ]
+              proc = _run(thumb_cmd, timeout=20)
+              if proc.returncode == 0 and out.is_file():
+                  thumbnails.append({
+                      "time_s": round(t, 3),
+                      "time_readable": _format_duration(t),
+                      "path": str(out),
+                      "size_bytes": out.stat().st_size,
+                  })
+              t += thumb_every
+              i += 1
+
+      # -- 5. Compose the LLM brief as markdown ---------------------------
+      def _md_row(label, value):
+          return f"- **{label}**: {value}"
+
+      lines: list[str] = []
+      lines.append(f"# Video brief — {video_path.name}")
+      lines.append("")
+      lines.append("## Metadata")
+      lines.append(_md_row("Duration", metadata["duration_readable"]))
+      lines.append(_md_row(
+          "Resolution",
+          f"{metadata['width']}x{metadata['height']}" if metadata["has_video"]
+          else "(no video track)",
+      ))
+      lines.append(_md_row(
+          "Video / audio codec",
+          f"{metadata['video_codec'] or '—'} / {metadata['audio_codec'] or '—'}",
+      ))
+      lines.append(_md_row("FPS", metadata["fps"] or "—"))
+      lines.append(_md_row(
+          "Audio",
+          f"{metadata['audio_channels']}ch @ {metadata['audio_sample_rate']} Hz"
+          if metadata["has_audio"] else "(silent)",
+      ))
+      lines.append(_md_row(
+          "Bitrate",
+          f"{metadata['bit_rate'] // 1000} kbps" if metadata["bit_rate"] else "—",
+      ))
+      lines.append(_md_row("File size", f"{metadata['size_bytes']:,} bytes"))
+
+      lines.append("")
+      lines.append(f"## Silence gaps (>= {min_silence}s, threshold {silence_db} dBFS)")
+      if not silence_gaps:
+          lines.append("_none detected_")
+      else:
+          for gap in silence_gaps[:50]:
+              lines.append(
+                  f"- {_format_duration(gap['start_s'])} → "
+                  f"{_format_duration(gap['end_s'])}  ({gap['duration_s']:.2f}s)"
+              )
+          if len(silence_gaps) > 50:
+              lines.append(f"_…{len(silence_gaps) - 50} more omitted_")
+
+      lines.append("")
+      lines.append(f"## Scene changes (threshold {scene_thresh})")
+      if not scene_changes:
+          lines.append("_none detected_")
+      else:
+          for ts in scene_changes:
+              lines.append(f"- {_format_duration(ts)}")
+
+      lines.append("")
+      lines.append(f"## Sampled thumbnails (every ~{thumb_every}s)")
+      if not thumbnails:
+          lines.append("_no thumbnails sampled_")
+      else:
+          for t in thumbnails:
+              lines.append(f"- {t['time_readable']} → `{t['path']}`")
+
+      brief_markdown = "\n".join(lines)
+
+      result = {
+          "path": str(video_path),
+          "output_dir": str(output_dir),
+          "metadata": metadata,
+          "silence_gaps": silence_gaps,
+          "scene_changes": scene_changes,
+          "thumbnails": thumbnails,
+          "brief_markdown": brief_markdown,
+      }
